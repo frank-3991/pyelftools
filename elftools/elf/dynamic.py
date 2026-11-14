@@ -293,14 +293,22 @@ class DynamicSegment(Segment, Dynamic):
         # So we must look for the dynamic section contained in the dynamic
         # segment, we do so by searching for the dynamic section whose content
         # is located at the same offset as the dynamic segment
-        stringtable = next(
-            (
-                elffile.get_section(section['sh_link'])
-                for section in elffile.iter_sections()
-                if isinstance(section, DynamicSection) and section['sh_offset'] == header['p_offset']
-            ),
-            None,
-        )
+        #
+        # A stripped or malformed file may have no usable section header table
+        # at all. In that case iter_sections() rejects the table; fall back to
+        # None and let Dynamic resolve the string table from the PT_DYNAMIC
+        # tags and loadable segments instead.
+        try:
+            stringtable = next(
+                (
+                    elffile.get_section(section['sh_link'])
+                    for section in elffile.iter_sections()
+                    if isinstance(section, DynamicSection) and section['sh_offset'] == header['p_offset']
+                ),
+                None,
+            )
+        except ELFError:
+            stringtable = None
         Segment.__init__(self, header, stream)
         Dynamic.__init__(self, stream, elffile, stringtable, self['p_offset'],
              self['p_filesz'] == 0)

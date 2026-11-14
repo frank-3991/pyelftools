@@ -176,6 +176,16 @@ class StringTableSection(Section):
         """ Get the string stored at the given offset in this string table.
         """
         table_offset = self['sh_offset']
+        # The string starting at |offset| needs at least its terminating NUL
+        # inside the table, so a valid offset is strictly smaller than the
+        # logical table size. Reject out-of-range offsets before touching the
+        # stream, and separately make sure the on-disk table bytes fully fit
+        # in the file.
+        if offset < 0 or offset >= self.data_size:
+            raise ELFParseError(
+                f"String table {self.name!r} index {offset} is out of range; "
+                f"the table at offset {table_offset} holds {self.data_size} bytes")
+        check_file_range(table_offset, self['sh_size'], self.elffile.stream_len)
         s = parse_cstring_from_stream(self.stream, table_offset + offset)
         return s.decode('utf-8', errors='replace') if s else ''
 

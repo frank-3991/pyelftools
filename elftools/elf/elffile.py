@@ -17,7 +17,7 @@ from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any
 
 from ..common.exceptions import ELFError, ELFParseError
-from ..common.utils import elf_assert, struct_parse
+from ..common.utils import check_file_range, elf_assert, struct_parse
 from ..dwarf.dwarf_util import _file_crc32
 from ..dwarf.dwarfinfo import DebugSectionDescriptor, DwarfConfig, DWARFInfo
 from ..ehabi.ehabiinfo import EHABIInfo
@@ -150,6 +150,18 @@ class ELFFile:
     def num_sections(self) -> int:
         """ Number of sections in the file
         """
+        return self._num_sections
+
+    @cached_property
+    def _num_sections(self) -> int:
+        """ Validate the section header table against the real file bounds and
+            return the number of entries it holds.
+
+            Both the regular count (e_shnum) and the extended count stored in
+            the sh_size field of section header 0 are checked. A declared count
+            whose table would extend past the end of the file is rejected, so
+            trailing bytes can never be mistaken for complete section headers.
+        """
         if self['e_shoff'] == 0:
             return 0
         # From the ELF ABI documentation at
@@ -161,9 +173,26 @@ class ELFFile:
         # sh_size field of the section header at index 0 (otherwise, the sh_size
         # member of the initial entry contains 0)."
         if self['e_shnum'] == 0:
-            section_header = self._get_section_header(0)
-            return section_header['sh_size']
-        return self['e_shnum']
+            section_count = self._read_section_header(0)['sh_size']
+        else:
+            section_count = self['e_shnum']
+        self._check_section_table_bounds(section_count)
+        return section_count
+
+    def _check_section_table_bounds(self, section_count: int) -> None:
+        """ Reject a section header table whose declared entries do not all fit
+            inside the file.
+        """
+        shentsize = self['e_shentsize']
+        table_offset = self['e_shoff']
+        table_end = self._section_offset(section_count)
+        if table_end > self.stream_len:
+            available = max(0, self.stream_len - table_offset)
+            raise ELFParseError(
+                f"Section header table at offset {table_offset} declares "
+                f"{section_count} entries of {shentsize} bytes, but only "
+                f"{available} of {section_count * shentsize} bytes are within "
+                f"the file of size {self.stream_len}")
 
     def get_section(self, n: int, type: TContainer[str] | None = None) -> Section:
         """ Get the section at index #n from the file (Section object or a
@@ -724,12 +753,23 @@ class ELFFile:
     def _get_section_header(self, n: int) -> Container:
         """ Find the header of section #n, parse it and return the struct
         """
+        section_count = self.num_sections()
+        if n < 0 or n >= section_count:
+            raise ELFParseError(
+                f"Section index {n} is out of range; the section header table "
+                f"contains {section_count} sections (indices 0 to "
+                f"{section_count - 1})")
+        return self._read_section_header(n)
 
+    def _read_section_header(self, n: int) -> Container:
+        """ Parse the section header at index #n without consulting the
+            validated section count. This is only used while determining the
+            extended count from section header 0; all other access goes
+            through _get_section_header.
+        """
         stream_pos = self._section_offset(n)
-        if stream_pos > self.stream_len:
-            msg = f"Reading section {n} at offset {stream_pos} past EOF {self.stream_len}"
-            raise ELFParseError(msg)
-
+        header_size = self.structs.Elf_Shdr.sizeof()
+        check_file_range(stream_pos, header_size, self.stream_len)
         return struct_parse(
             self.structs.Elf_Shdr,
             self.stream,
