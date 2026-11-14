@@ -108,6 +108,34 @@ def stream_read(stream: IO[bytes], offset: int, size: int) -> bytes:
     return data
 
 
+# Largest single read issued for a file-backed range, so that processing a
+# large range does not need a buffer as large as the whole range.
+STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def iter_stream_range(
+    stream: IO[bytes],
+    offset: int,
+    size: int,
+) -> Generator[bytes, None, None]:
+    """ Yield the bytes of a file-backed range in bounded chunks.
+
+        The range is checked against the current length of the stream before
+        each chunk is read, so a file that shrinks after it was opened is
+        detected instead of yielding short data. An empty range still goes
+        through stream_read, so an invalid one is rejected consistently.
+    """
+    if size <= 0:
+        # Reject an empty or invalid range before any data is read.
+        yield stream_read(stream, offset, size)
+        return
+    while size > 0:
+        chunk_size = min(size, STREAM_CHUNK_SIZE)
+        yield stream_read(stream, offset, chunk_size)
+        offset += chunk_size
+        size -= chunk_size
+
+
 def elf_assert(cond: object, msg: str = '') -> None:
     """ Assert that cond is True, otherwise raise ELFError(msg)
     """

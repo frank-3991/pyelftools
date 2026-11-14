@@ -1,14 +1,19 @@
 """Bounds checks for file-backed section and segment data."""
+import struct
 import unittest
 import zlib
 from contextlib import contextmanager
 from io import BytesIO
 from tempfile import TemporaryFile
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 from elftools.common.exceptions import ELFCompressionError, ELFParseError
 from elftools.construct import Container
+from elftools.elf.compression import (
+    decompress_into,
+    gnu_compression_info,
+)
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.sections import Section
 from elftools.elf.segments import Segment
@@ -132,6 +137,110 @@ class TestDataBounds(unittest.TestCase):
                     stream.truncate(len(stream.getvalue()) - 1)
                     with self.assertRaises(ELFParseError):
                         section.data()
+
+    def compressed_section(self, payload, declared_size, *, elfclass=64):
+        """ Build a section whose data is a zlib stream inside an Elf_Chdr, as
+            SHF_COMPRESSED requires.
+        """
+        structs = self.structs(elfclass)
+        header = structs.Elf_Chdr.build(Container(
+            ch_type='ELFCOMPRESS_ZLIB', ch_reserved=0,
+            ch_size=declared_size, ch_addralign=1))
+        stored = header + payload
+        stream = BytesIO(b'prefix' + stored)
+        return self.section(stream, 6, len(stored), compressed=True, structs=structs)
+
+    def test_compressed_truncated_stream(self):
+        data = b'hello world ' * 1000
+        section = self.compressed_section(zlib.compress(data)[:-3], len(data))
+        with self.assertRaisesRegex(ELFCompressionError, 'truncated'):
+            section.data()
+
+    def test_compressed_corrupt_stream(self):
+        data = b'hello world ' * 1000
+        corrupt = bytearray(zlib.compress(data))
+        corrupt[10] ^= 0xff
+        section = self.compressed_section(bytes(corrupt), len(data))
+        with self.assertRaisesRegex(ELFCompressionError, 'Invalid compressed data'):
+            section.data()
+
+    def test_compressed_declared_size_mismatch(self):
+        data = b'hello world ' * 1000
+        # A declaration that is too large must not be allocated up front; it
+        # is caught by the size check after inflating the real data.
+        section = self.compressed_section(zlib.compress(data), 2**40)
+        with self.assertRaisesRegex(
+                ELFCompressionError, 'should be 1099511627776 bytes long'):
+            section.data()
+        section = self.compressed_section(zlib.compress(data), len(data) - 1)
+        with self.assertRaisesRegex(ELFCompressionError, 'longer than the declared'):
+            section.data()
+
+    def test_compressed_output_not_allocated_from_declared_size(self):
+        # A huge declared size must not turn into a huge inflate request: every
+        # step is capped, so a small stream is inflated in small pieces.
+        data = b'A' * 4096
+        limits = []
+        real_decompressobj = zlib.decompressobj
+
+        class RecordingDecompressor:
+            def __init__(self):
+                self._decomp = real_decompressobj()
+
+            def decompress(self, chunk, limit=0):
+                limits.append(limit)
+                return self._decomp.decompress(chunk, limit)
+
+            @property
+            def eof(self):
+                return self._decomp.eof
+
+            @property
+            def unconsumed_tail(self):
+                return self._decomp.unconsumed_tail
+
+        section = self.compressed_section(zlib.compress(data), 2**40)
+        with (patch('elftools.elf.compression.zlib.decompressobj', RecordingDecompressor),
+              self.assertRaisesRegex(ELFCompressionError, 'should be')):
+            section.data()
+        self.assertTrue(limits)
+        for limit in limits:
+            self.assertLessEqual(limit, 64 * 1024)
+
+    def test_compressed_truncated_stream_yields_no_data(self):
+        data = b'hello world ' * 1000
+        section = self.compressed_section(zlib.compress(data)[:-3], len(data))
+        dest = BytesIO()
+        with self.assertRaises(ELFCompressionError):
+            decompress_into(section.elffile.stream, section.compression_info, dest)
+
+    def test_uncompressed_section_data(self):
+        stream = BytesIO(b'prefix' + b'abcdef')
+        section = self.section(stream, 6, 6)
+        self.assertEqual(section.data(), b'abcdef')
+        stream = Mock(wraps=BytesIO(b'prefix' + b'abcdef'))
+        section = self.section(stream, 0, 6)
+        self.assertEqual(section.data(), b'prefix')
+        # Uncompressed data is one exact read of the section size.
+        stream.read.assert_called_once_with(6)
+
+    def test_gnu_compressed_dwarf_section(self):
+        # The GNU-style "ZLIB" header is parsed from the section data.
+        data = b'hello world ' * 1000
+        payload = struct.pack('>4sQ', b'ZLIB', len(data)) + zlib.compress(data)
+        stream = BytesIO(payload)
+        info = gnu_compression_info(stream, 0, len(payload))
+        self.assertEqual(info.uncompressed_size, len(data))
+        self.assertEqual(info.stored_offset, 12)
+        self.assertEqual(info.stored_size, len(payload) - 12)
+        dest = BytesIO()
+        self.assertEqual(decompress_into(stream, info, dest), len(data))
+        self.assertEqual(dest.getvalue(), data)
+        bad = struct.pack('>4sQ', b'ZLX', len(data)) + zlib.compress(data)
+        with self.assertRaisesRegex(ELFCompressionError, 'Invalid compression type'):
+            gnu_compression_info(BytesIO(bad), 0, len(bad))
+        with self.assertRaisesRegex(ELFCompressionError, 'too small'):
+            gnu_compression_info(BytesIO(b'ZLIB'), 0, 4)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@
 import os
 import unittest
 from contextlib import contextmanager
+from io import BytesIO
 
 from elftools.common.exceptions import ELFCompressionError
 from elftools.elf.constants import SH_FLAGS
@@ -65,6 +66,53 @@ class TestCompressedSupport(unittest.TestCase):
                 )
             else:
                 self.fail('An exception was exected')
+
+    def test_compressed_gnu_style(self):
+        """ A GNU-style .zdebug_ section is read like an SHF_COMPRESSED one.
+        """
+        path = os.path.join('test', 'testfiles_for_readelf', 'zdebug_mixed.so.elf')
+        with open(path, 'rb') as f:
+            elf = ELFFile(f)
+            dwarf = elf.get_dwarf_info()
+            self.assertEqual(dwarf.debug_info_sec.name, '.zdebug_info')
+            self.assertEqual(dwarf.debug_info_sec.size, 147)
+            self.assertEqual(
+                [cu.cu_offset for cu in dwarf.iter_CUs()], [0])
+            # Not every debug section of that file was compressed.
+            line_str = elf.get_section_by_name('.debug_line_str')
+            self.assertEqual(line_str.data(), b'/tmp\x00zdebug_mixed.c\x00')
+
+    def test_compressed_gnu_style_truncated(self):
+        """ Truncating the stored stream of a .zdebug_ section is reported
+            instead of leaving partial DWARF data behind.
+        """
+        path = os.path.join('test', 'testfiles_for_readelf', 'zdebug_mixed.so.elf')
+        with open(path, 'rb') as f:
+            data = f.read()
+        elf = ELFFile(BytesIO(data))
+        section = elf.get_section_by_name('.zdebug_info')
+        offset, size = section['sh_offset'], section['sh_size']
+        # Wipe the tail of the compressed stream, then read it as .zdebug_info.
+        corrupted = bytearray(data)
+        corrupted[offset + size - 14: offset + size - 4] = b'\0' * 10
+        elf = ELFFile(BytesIO(bytes(corrupted)))
+        with self.assertRaises(ELFCompressionError):
+            elf.get_dwarf_info()
+
+    def test_compressed_gnu_style_bad_magic(self):
+        """ A .zdebug_ section without the ZLIB magic is rejected.
+        """
+        path = os.path.join('test', 'testfiles_for_readelf', 'zdebug_mixed.so.elf')
+        with open(path, 'rb') as f:
+            data = f.read()
+        elf = ELFFile(BytesIO(data))
+        section = elf.get_section_by_name('.zdebug_info')
+        offset = section['sh_offset']
+        corrupted = bytearray(data)
+        corrupted[offset:offset + 4] = b'XLIB'
+        elf = ELFFile(BytesIO(bytes(corrupted)))
+        with self.assertRaisesRegex(ELFCompressionError, 'Invalid compression type'):
+            elf.get_dwarf_info()
 
     # Test helpers
 

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import io
 import os
-import struct
-import zlib
 from functools import cached_property
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any
@@ -21,6 +19,7 @@ from ..common.utils import elf_assert, struct_parse
 from ..dwarf.dwarf_util import _file_crc32
 from ..dwarf.dwarfinfo import DebugSectionDescriptor, DwarfConfig, DWARFInfo
 from ..ehabi.ehabiinfo import EHABIInfo
+from .compression import decompress_into, gnu_compression_info
 from .constants import SHN_INDICES
 from .dynamic import DynamicSection, DynamicSegment
 from .gnuversions import GNUVerDefSection, GNUVerNeedSection, GNUVerSymSection
@@ -356,12 +355,10 @@ class ELFFile:
             if section is None:
                 debug_sections[secname] = None
             else:
-                dwarf_section = self._read_dwarf_section(
+                debug_sections[secname] = self._read_dwarf_section(
                     section,
-                    relocate_dwarf_sections)
-                if compressed:
-                    dwarf_section = self._decompress_dwarf_section(dwarf_section)
-                debug_sections[secname] = dwarf_section
+                    relocate_dwarf_sections,
+                    gnu_compressed=compressed)
 
         # Lookup if we have any of the .gnu_debugaltlink (GNU proprietary
         # implementation) or .debug_sup sections, referencing a supplementary
@@ -911,15 +908,43 @@ class ELFFile:
         self,
         section: Section,
         relocate_dwarf_sections: bool,
+        gnu_compressed: bool = False,
     ) -> DebugSectionDescriptor:
         """ Read the contents of a DWARF section from the stream and return a
-            DebugSectionDescriptor. Relocate ET_REL data if requested.
+            DebugSectionDescriptor. Compressed data is decompressed, and ET_REL
+            data is relocated if requested.
+
+            gnu_compressed marks a .zdebug_* section, whose data is compressed
+            in the GNU style without the SHF_COMPRESSED flag.
         """
         phantom_bytes = self.has_phantom_bytes()
         # The section data is read into a new stream, for processing
         section_stream = BytesIO()
-        section_data = section.data()
-        section_stream.write(section_data[::2] if phantom_bytes else section_data)
+
+        # SHF_COMPRESSED takes precedence: its header describes the data
+        # layout unambiguously. GNU-style .zdebug_* data has no such flag and
+        # carries its own header instead.
+        info = section.compression_info
+        if info is None and gnu_compressed:
+            info = gnu_compression_info(
+                self.stream, section['sh_offset'], section['sh_size'])
+
+        if info is not None:
+            # Decompress in bounded chunks, straight into the stream that will
+            # be parsed. Nothing is sized from the declared uncompressed size,
+            # and a truncated or malformed stream raises before a descriptor
+            # exists, so partial data can never reach the DWARF parser.
+            size = decompress_into(self.stream, info, section_stream)
+        else:
+            section_data = section.data()
+            section_stream.write(section_data)
+            size = len(section_data)
+
+        if phantom_bytes:
+            # Drop the odd bytes from the section data, after decompression.
+            section_data = section_stream.getvalue()[::2]
+            section_stream = BytesIO(section_data)
+            size = len(section_data)
 
         # Linkers can retain relocation entries in ET_EXEC/ET_DYN files
         # (e.g. with --emit-relocs), but have already applied them. Reapplying
@@ -939,41 +964,8 @@ class ELFFile:
                 stream=section_stream,
                 name=section.name,
                 global_offset=section['sh_offset'],
-                size=section.data_size//2 if phantom_bytes else section.data_size,
+                size=size,
                 address=section['sh_addr'])
-
-    @staticmethod
-    def _decompress_dwarf_section(section: DebugSectionDescriptor) -> DebugSectionDescriptor:
-        """ Returns the uncompressed contents of the provided DWARF section.
-        """
-        # TODO: support other compression formats from readelf.c
-        assert section.size > 12, 'Unsupported compression format.'
-
-        section.stream.seek(0)
-        # According to readelf.c the content should contain "ZLIB"
-        # followed by the uncompressed section size - 8 bytes in
-        # big-endian order
-        compression_type = section.stream.read(4)
-        assert compression_type == b'ZLIB', \
-            f'Invalid compression type: {compression_type!r}'
-
-        uncompressed_size = struct.unpack('>Q', section.stream.read(8))[0]
-
-        decompressor = zlib.decompressobj()
-        uncompressed_stream = BytesIO()
-        while True:
-            chunk = section.stream.read(4096)
-            if not chunk:
-                break
-            uncompressed_stream.write(decompressor.decompress(chunk))
-        uncompressed_stream.write(decompressor.flush())
-
-        uncompressed_stream.seek(0, io.SEEK_END)
-        size = uncompressed_stream.tell()
-        assert uncompressed_size == size, \
-                f'Wrong uncompressed size: expected {uncompressed_size!r}, but got {size!r}'
-
-        return section._replace(stream=uncompressed_stream, size=size)
 
     def close(self) -> None:
         self.stream.close()
