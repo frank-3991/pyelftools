@@ -283,6 +283,13 @@ class RelocationHandler:
     """
     def __init__(self, elffile: ELFFile) -> None:
         self.elffile = elffile
+        # Symbol values cached by (symbol table section index, symbol index).
+        # Keying by the table's section index keeps symbols coming from
+        # different tables (e.g. .symtab vs .dynsym) isolated, even when the
+        # symbol index is the same. The cache lives on the handler, which
+        # serves a single ELFFile, so results are never shared between ELF
+        # instances with different endianness or word size.
+        self._sym_value_cache: dict[tuple[int, int], int] = {}
 
     def find_relocations_for_section(self, section: Section) -> RelocationSection | None:
         """ Given a section, find the relocation section for it in the ELF
@@ -314,16 +321,43 @@ class RelocationHandler:
             are not translated to stream offsets by this API.
         """
         # The symbol table associated with this relocation section
-        symtab = self.elffile.get_section(reloc_section['sh_link'])
+        symtab_index = reloc_section['sh_link']
+        symtab = self.elffile.get_section(symtab_index)
         assert isinstance(symtab, SymbolTableSection)
         for reloc in reloc_section.iter_relocations():
-            self._do_apply_relocation(stream, reloc, symtab)
+            self._do_apply_relocation(stream, reloc, symtab, symtab_index)
+
+    def _get_symbol_value(
+        self,
+        symtab: SymbolTableSection,
+        symtab_index: int | None,
+        sym_index: int,
+    ) -> int:
+        """ Return the st_value of symbol #sym_index in symtab.
+
+            Values are cached per (symbol table section index, symbol index)
+            so that repeated relocations against the same table do not
+            re-read and re-parse the same symbol entries. The cache is only
+            consulted when the table's section index is known, and failed
+            lookups are not cached, so a later attempt still reports the
+            error or produces a fresh result.
+        """
+        if symtab_index is None:
+            return symtab.get_symbol(sym_index)['st_value']
+        key = (symtab_index, sym_index)
+        try:
+            return self._sym_value_cache[key]
+        except KeyError:
+            sym_value = symtab.get_symbol(sym_index)['st_value']
+            self._sym_value_cache[key] = sym_value
+            return sym_value
 
     def _do_apply_relocation(
         self,
         stream: IO[bytes],
         reloc: Relocation,
         symtab: SymbolTableSection,
+        symtab_index: int | None = None,
     ) -> None:
         arch = self.elffile.get_machine_arch()
         reloc_type = reloc['r_info_type']
@@ -341,10 +375,11 @@ class RelocationHandler:
         # the symbol mentioned in the relocation, as well as the relocation
         # recipe which tells us how to actually perform it.
         # All peppered with some sanity checking.
-        if reloc['r_info_sym'] >= symtab.num_symbols():
+        sym_index = reloc['r_info_sym']
+        if sym_index >= symtab.num_symbols():
             raise ELFRelocationError(
-                'Invalid symbol reference in relocation: index {}'.format(reloc['r_info_sym']))
-        sym_value = symtab.get_symbol(reloc['r_info_sym'])['st_value']
+                'Invalid symbol reference in relocation: index {}'.format(sym_index))
+        sym_value = self._get_symbol_value(symtab, symtab_index, sym_index)
 
         recipe = None
 

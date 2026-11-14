@@ -907,6 +907,14 @@ class ELFFile:
         """
         return struct_parse(self.structs.Elf_Ehdr, self.stream, stream_pos=0)
 
+    @cached_property
+    def _relocation_handler(self) -> RelocationHandler:
+        """ A single RelocationHandler shared by all sections of this file,
+            so that symbol values parsed while relocating one section can be
+            reused when relocating the others.
+        """
+        return RelocationHandler(self)
+
     def _read_dwarf_section(
         self,
         section: Section,
@@ -925,7 +933,7 @@ class ELFFile:
         # (e.g. with --emit-relocs), but have already applied them. Reapplying
         # REL entries would treat the relocated value as the original addend.
         if relocate_dwarf_sections and self['e_type'] == 'ET_REL':
-            reloc_handler = RelocationHandler(self)
+            reloc_handler = self._relocation_handler
             reloc_section = reloc_handler.find_relocations_for_section(section)
             if reloc_section is not None:
                 if phantom_bytes:

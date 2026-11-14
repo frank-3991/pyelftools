@@ -3,7 +3,7 @@ import unittest
 from io import BytesIO
 from unittest.mock import Mock
 
-from elftools.common.exceptions import ELFRelocationError
+from elftools.common.exceptions import ELFError, ELFRelocationError
 from elftools.construct import Container
 from elftools.dwarf.dwarf_expr import DWARFExprParser
 from elftools.elf.dynamic import DynamicSection, DynamicSegment
@@ -100,6 +100,66 @@ class TestRelocation(unittest.TestCase):
         stream = BytesIO(b'\xaa\0\0\0\0\xbb')
         handler._do_apply_relocation(stream, reloc, symtab)
         self.assertEqual(stream.getvalue(), b'\xaa\x23\x01\0\0\xbb')
+        symtab.get_symbol.assert_called_once_with(0)
+
+    def _x64_reloc(self, handler, symbol=0):
+        return Relocation(Container(r_info_type=10, r_info_sym=symbol,
+                                    r_offset=0, r_addend=0), handler.elffile)
+
+    def test_symbol_value_cached_per_symtab(self):
+        # Repeated relocations against the same symbol table read each
+        # symbol only once.
+        handler, symtab = self._make_handler('x64')
+        reloc = self._x64_reloc(handler)
+        for _ in range(3):
+            stream = BytesIO(b'\0\0\0\0')
+            handler._do_apply_relocation(stream, reloc, symtab, symtab_index=7)
+            self.assertEqual(stream.getvalue(), b'\x00\x01\0\0')
+        symtab.get_symbol.assert_called_once_with(0)
+
+    def test_symbol_value_cache_isolated_between_symtabs(self):
+        # The same symbol index in a different symbol table is a different
+        # symbol and must not reuse the cached value.
+        handler, symtab = self._make_handler('x64')
+        reloc = self._x64_reloc(handler)
+        handler._do_apply_relocation(BytesIO(b'\0\0\0\0'), reloc, symtab, symtab_index=7)
+        handler._do_apply_relocation(BytesIO(b'\0\0\0\0'), reloc, symtab, symtab_index=9)
+        self.assertEqual(symtab.get_symbol.call_count, 2)
+
+    def test_symbol_value_cache_not_shared_between_elffiles(self):
+        handler1, symtab1 = self._make_handler('x64')
+        handler2, symtab2 = self._make_handler('x64')
+        handler1._do_apply_relocation(
+            BytesIO(b'\0\0\0\0'), self._x64_reloc(handler1), symtab1, symtab_index=7)
+        handler2._do_apply_relocation(
+            BytesIO(b'\0\0\0\0'), self._x64_reloc(handler2), symtab2, symtab_index=7)
+        symtab1.get_symbol.assert_called_once_with(0)
+        symtab2.get_symbol.assert_called_once_with(0)
+
+    def test_symbol_value_failure_not_cached(self):
+        # A failed symbol read is not cached: the next relocation retries and
+        # gets its own independent result.
+        handler, symtab = self._make_handler('x64')
+        symtab.get_symbol.side_effect = [ELFError('read failed'), {'st_value': 0x100}]
+        reloc = self._x64_reloc(handler)
+        with self.assertRaises(ELFError):
+            handler._do_apply_relocation(BytesIO(b'\0\0\0\0'), reloc, symtab, symtab_index=7)
+        stream = BytesIO(b'\0\0\0\0')
+        handler._do_apply_relocation(stream, reloc, symtab, symtab_index=7)
+        self.assertEqual(stream.getvalue(), b'\x00\x01\0\0')
+        self.assertEqual(symtab.get_symbol.call_count, 2)
+
+    def test_invalid_symbol_index_not_cached(self):
+        # An out-of-range symbol index raises every time, even after valid
+        # symbols of the same table were cached.
+        handler, symtab = self._make_handler('x64')
+        handler._do_apply_relocation(
+            BytesIO(b'\0\0\0\0'), self._x64_reloc(handler), symtab, symtab_index=7)
+        bad_reloc = self._x64_reloc(handler, symbol=5)
+        for _ in range(2):
+            with self.assertRaisesRegex(ELFRelocationError, 'Invalid symbol reference'):
+                handler._do_apply_relocation(
+                    BytesIO(b'\0\0\0\0'), bad_reloc, symtab, symtab_index=7)
         symtab.get_symbol.assert_called_once_with(0)
 
     def test_unsupported_relocations(self):
